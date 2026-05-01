@@ -70,7 +70,7 @@ function getEnvironment() {
 }
 
 function getTopic(userId) {
-  return config.notificationTopicTemplate.replace('{userId}', userId);
+  return `v2.users.${userId}.conversationsummary`;
 }
 
 function getAccessToken() {
@@ -216,33 +216,36 @@ async function waitForACWAndWrapup(conversationId, participantId) {
 }
 
 async function handleConversationNotification(topicName, eventBody) {
-  if (topicName !== getTopic(currentUser.id)) return;
+  if (!topicName.includes('conversationsummary')) return;
 
-  const conversationId = eventBody.id;
+  const conversationId = eventBody.conversationId;
   if (!conversationId) return;
 
-  const agentParticipant = eventBody.participants?.find(isAgentParticipantForCurrentUser);
+  const participants = eventBody.participants || [];
+
+  const agentParticipant = participants.find(p =>
+    p.userId === currentUser.id && p.purpose === 'agent'
+  );
+
   if (!agentParticipant) return;
 
-  const participantId = agentParticipant.id || agentParticipant.participantId;
-
-  const attrs = await getConversationCustomAttributes(conversationId);
-  if (!matchesForcedUnpark(attrs)) return;
-
-  const state = agentParticipant.state || agentParticipant.participantState;
   const wrapupRequired = agentParticipant.wrapupRequired;
+  const state = agentParticipant.state;
 
-  log('Live Notification Check', 'info', {
+  log('Summary Event Check', 'info', {
     conversationId,
-    state,
-    wrapupRequired
+    wrapupRequired,
+    state
   });
 
   const interactionActive = state === 'wrapup' || state === 'connected';
 
-  if (!wrapupRequired || !interactionActive) {
-    return;
-  }
+  if (!wrapupRequired || !interactionActive) return;
+
+  const attrs = await getConversationCustomAttributes(conversationId);
+  if (!matchesForcedUnpark(attrs)) return;
+
+  const participantId = agentParticipant.id;
 
   const key = `${conversationId}:${participantId}`;
   if (recentlyPatched.has(key)) return;
@@ -254,7 +257,7 @@ async function handleConversationNotification(topicName, eventBody) {
 
     const verification = await verifyParticipant(conversationId, participantId);
 
-    log('✅ Wrap-up applied (event-driven)', 'info', {
+    log('✅ Wrap-up applied (summary event)', 'info', {
       conversationId,
       verification
     });
