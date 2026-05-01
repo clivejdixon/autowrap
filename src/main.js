@@ -64,7 +64,7 @@ function storeInterpolatedValues() {
 function getEnvironment() {
   const env = getInterpolatedValue('gcTargetEnv');
   if (!env) {
-    throw new Error('Missing gcTargetEnv. Configure URL interpolation in the Genesys Client App URL.');
+    throw new Error('Missing gcTargetEnv.');
   }
   return env;
 }
@@ -76,15 +76,16 @@ function getTopic(userId) {
 function getAccessToken() {
   const token = apiClient.authData?.accessToken || apiClient.accessToken;
   if (!token) {
-    throw new Error('No access token available on ApiClient');
+    throw new Error('No access token');
   }
   return token;
 }
 
 async function authenticatedFetch(path, options = {}) {
   const token = getAccessToken();
-  const basePath = apiClient.apiClient?.config?.host || apiClient.environment || `https://api.${getEnvironment()}`;
-  const url = path.startsWith('http') ? path : `${basePath}${path}`;
+  const basePath = `https://api.${getEnvironment()}`;
+  const url = `${basePath}${path}`;
+
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -95,14 +96,11 @@ async function authenticatedFetch(path, options = {}) {
   });
 
   if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`${response.status} ${response.statusText} ${errBody}`.trim());
+    const err = await response.text().catch(() => '');
+    throw new Error(`${response.status} ${response.statusText} ${err}`);
   }
 
-  if (response.status === 204) {
-    return null;
-  }
-
+  if (response.status === 204) return null;
   return response.json().catch(() => null);
 }
 
@@ -113,241 +111,130 @@ async function authenticate() {
   storeInterpolatedValues();
   elements.env.textContent = env;
 
-  if (config.authFlow === 'implicit') {
-    await apiClient.loginImplicitGrant(config.clientId, config.redirectUri);
-  } else if (config.authFlow === 'pkce') {
-    await apiClient.loginPKCEGrant(config.clientId, config.redirectUri);
-  } else {
-    throw new Error(`Unsupported authFlow: ${config.authFlow}`);
-  }
+  await apiClient.loginImplicitGrant(config.clientId, config.redirectUri);
 
   currentUser = await usersApi.getUsersMe();
-  elements.user.textContent = `${currentUser.name} (${currentUser.id})`;
-  return currentUser;
+  elements.user.textContent = `${currentUser.name}`;
 }
 
 async function initClientApp() {
-  const env = getEnvironment();
   clientApp = new ClientApp({
-    gcTargetEnv: env
+    gcTargetEnv: getEnvironment()
   });
-
-  if (clientApp.lifecycle?.addEventListener) {
-    clientApp.lifecycle.addEventListener('focus', () => log('Client app focused'));
-  }
 }
 
 async function createNotificationChannel() {
   notificationChannel = await notificationsApi.postNotificationsChannels();
-  elements.channel.textContent = notificationChannel.id;
-  await notificationsApi.postNotificationsChannelSubscriptions(notificationChannel.id, [
-    { id: getTopic(currentUser.id) }
-  ]);
-  log('Subscribed to notifications topic', 'info', { topic: getTopic(currentUser.id), channelId: notificationChannel.id });
+
+  await notificationsApi.postNotificationsChannelSubscriptions(
+    notificationChannel.id,
+    [{ id: getTopic(currentUser.id) }]
+  );
 }
 
 function connectWebSocket() {
   socket = new WebSocket(notificationChannel.connectUri);
 
-  socket.addEventListener('open', () => {
-    log('WebSocket connected');
-    setStatus('Listening for wrap-up-required events');
-  });
-
-  socket.addEventListener('close', (event) => {
-    log('WebSocket closed', event.wasClean ? 'info' : 'warn', { code: event.code, reason: event.reason });
-    if (running) {
-      setStatus('Socket closed; restart helper');
-    }
-  });
-
-  socket.addEventListener('error', () => {
-    log('WebSocket error', 'error');
-    setStatus('Socket error');
-  });
-
   socket.addEventListener('message', async (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      if (!payload.topicName || !payload.eventBody) return;
-      await handleConversationNotification(payload.topicName, payload.eventBody);
-    } catch (error) {
-      log('Failed to process notification', 'error', { message: error.message });
-    }
+    const payload = JSON.parse(event.data);
+    if (!payload.topicName || !payload.eventBody) return;
+
+    await handleConversationNotification(payload.topicName, payload.eventBody);
   });
 }
 
-function isAgentParticipantForCurrentUser(participant) {
-  return participant?.purpose === 'agent' && participant?.userId === currentUser.id;
-}
-
-function isEmailConversation(eventBody) {
-  return (eventBody.participants || []).some((p) => (p.calls || []).length || (p.messages || []).length || (p.sessions || []).some((s) => s.mediaType === 'email'));
+function isAgentParticipantForCurrentUser(p) {
+  return p?.purpose === 'agent' && p?.userId === currentUser.id;
 }
 
 async function getConversationCustomAttributes(conversationId) {
   try {
     const attrs = await authenticatedFetch(`/api/v2/conversations/${conversationId}/customattributes`);
     return attrs?.customAttributes || attrs || {};
-  } catch (error) {
-    log('Custom attributes endpoint failed; falling back to conversation GET', 'warn', { conversationId, message: error.message });
-    try {
-      const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
-      return convo?.customAttributes || convo?.attributes || {};
-    } catch (fallbackError) {
-      log('Fallback conversation GET failed', 'warn', { conversationId, message: fallbackError.message });
-      return {};
-    }
+  } catch {
+    return {};
   }
 }
 
-function matchesForcedUnpark(attributes) {
-  const actual = attributes?.[config.requiredCustomAttribute.key];
-  return String(actual).toLowerCase() === String(config.requiredCustomAttribute.value).toLowerCase();
-}
-
-function shouldPatch(participant, conversationId) {
-  if (!participant?.wrapupRequired) return false;
-  if (participant?.wrapup?.code === config.wrapupPayload.code) return false;
-  const dedupeKey = `${conversationId}:${participant.id || participant.participantId}`;
-  const lastPatched = recentlyPatched.get(dedupeKey) || 0;
-  return Date.now() - lastPatched > config.dedupeWindowMs;
+function matchesForcedUnpark(attrs) {
+  return String(attrs?.ForcedUnpark).toLowerCase() === 'true';
 }
 
 async function patchAgentParticipantWrapup(conversationId, participantId) {
-  const result = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}/participants/${participantId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({
-      wrapup: config.wrapupPayload
-    })
-  });
-  return result;
+  return authenticatedFetch(
+    `/api/v2/conversations/emails/${conversationId}/participants/${participantId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        wrapup: config.wrapupPayload
+      })
+    }
+  );
 }
 
 async function verifyParticipant(conversationId, participantId) {
-  await new Promise((resolve) => setTimeout(resolve, config.pollVerificationMs));
+  await new Promise((r) => setTimeout(r, 300));
+
   const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
-  const participant = (convo.participants || []).find((p) => (p.id || p.participantId) === participantId);
+  const p = convo.participants.find((x) => (x.id || x.participantId) === participantId);
+
   return {
-    participantId,
-    wrapupRequired: participant?.wrapupRequired,
-    wrapup: participant?.wrapup || null,
-    state: participant?.state || participant?.participantState || null
+    wrapupRequired: p?.wrapupRequired,
+    wrapup: p?.wrapup,
+    state: p?.state
   };
+}
+
+async function waitForACWAndWrapup(conversationId, participantId) {
+  const key = `${conversationId}:${participantId}`;
+  if (recentlyPatched.has(key)) return;
+
+  for (let i = 0; i < 6; i++) {
+    const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
+    const p = convo.participants.find(isAgentParticipantForCurrentUser);
+
+    if (!p) return;
+
+    const state = p.state;
+    const active = state === 'wrapup' || state === 'connected';
+
+    log('ACW Check', 'info', { state, wrapupRequired: p.wrapupRequired });
+
+    if (p.wrapupRequired && active) {
+      recentlyPatched.set(key, Date.now());
+
+      await patchAgentParticipantWrapup(conversationId, participantId);
+
+      const v = await verifyParticipant(conversationId, participantId);
+
+      log('Wrap-up applied', 'info', v);
+      return;
+    }
+
+    await new Promise((r) => setTimeout(r, 400));
+  }
 }
 
 async function handleConversationNotification(topicName, eventBody) {
   if (topicName !== getTopic(currentUser.id)) return;
-  if (!isEmailConversation(eventBody)) return;
 
-  const conversationId = eventBody.id || eventBody.conversationId;
+  const conversationId = eventBody.id;
   if (!conversationId) return;
 
-  const agentParticipant = (eventBody.participants || []).find(isAgentParticipantForCurrentUser);
-  if (!agentParticipant) return;
+  const p = eventBody.participants?.find(isAgentParticipantForCurrentUser);
+  if (!p) return;
 
-  if (!agentParticipant.wrapupRequired) {
-    return;
-  }
+  const attrs = await getConversationCustomAttributes(conversationId);
+  if (!matchesForcedUnpark(attrs)) return;
 
-  const participantId = agentParticipant.id || agentParticipant.participantId;
-  const attributes = await getConversationCustomAttributes(conversationId);
-
-  log('Notification candidate detected', 'info', {
-    conversationId,
-    participantId,
-    wrapupRequired: agentParticipant.wrapupRequired,
-    forcedUnpark: attributes?.ForcedUnpark,
-    existingWrapup: agentParticipant.wrapup || null
-  });
-
-  if (!matchesForcedUnpark(attributes)) {
-    return;
-  }
-
-  if (!shouldPatch(agentParticipant, conversationId)) {
-    return;
-  }
-
-  const dedupeKey = `${conversationId}:${participantId}`;
-  recentlyPatched.set(dedupeKey, Date.now());
-  setStatus(`Patching wrap-up for ${conversationId}`);
-
-  try {
-    await patchAgentParticipantWrapup(conversationId, participantId);
-    const verification = await verifyParticipant(conversationId, participantId);
-    log('Auto wrap-up patch sent', 'info', {
-      conversationId,
-      participantId,
-      verification
-    });
-    setStatus(`Patched ${conversationId}`);
-
-    if (config.enableClientAppToast && clientApp?.alerting?.showToastPopup) {
-      clientApp.alerting.showToastPopup({
-        title: 'Auto wrap-up applied',
-        message: `Conversation ${conversationId} patched with ${config.wrapupPayload.name}`
-      });
-    }
-  } catch (error) {
-    log('Auto wrap-up patch failed', 'error', {
-      conversationId,
-      participantId,
-      message: error.message
-    });
-    setStatus(`Patch failed for ${conversationId}`);
-  }
+  await waitForACWAndWrapup(conversationId, p.id || p.participantId);
 }
 
 async function start() {
-  if (running) return;
-  running = true;
-  elements.startBtn.disabled = true;
-  elements.stopBtn.disabled = false;
-
-  try {
-    await initClientApp();
-    await authenticate();
-    await createNotificationChannel();
-    connectWebSocket();
-    log('Helper started');
-  } catch (error) {
-    running = false;
-    elements.startBtn.disabled = false;
-    elements.stopBtn.disabled = true;
-    log('Failed to start helper', 'error', { message: error.message });
-    setStatus('Startup failed');
-  }
+  await initClientApp();
+  await authenticate();
+  await createNotificationChannel();
+  connectWebSocket();
 }
 
-async function stop() {
-  running = false;
-  elements.startBtn.disabled = false;
-  elements.stopBtn.disabled = true;
-
-  if (socket) {
-    socket.close();
-    socket = null;
-  }
-
-  if (notificationChannel?.id) {
-    try {
-      await notificationsApi.deleteNotificationsChannel(notificationChannel.id);
-    } catch (error) {
-      log('Failed to delete channel cleanly', 'warn', { channelId: notificationChannel.id, message: error.message });
-    }
-  }
-
-  notificationChannel = null;
-  elements.channel.textContent = '-';
-  setStatus('Stopped');
-  log('Helper stopped');
-}
-
-elements.startBtn.addEventListener('click', start);
-elements.stopBtn.addEventListener('click', stop);
-elements.clearBtn.addEventListener('click', () => {
-  elements.log.textContent = '';
-});
-
-log('App loaded. Click Start helper after configuring src/config.js.');
+elements.startBtn.onclick = start;
