@@ -221,13 +221,47 @@ async function handleConversationNotification(topicName, eventBody) {
   const conversationId = eventBody.id;
   if (!conversationId) return;
 
-  const p = eventBody.participants?.find(isAgentParticipantForCurrentUser);
-  if (!p) return;
+  const agentParticipant = eventBody.participants?.find(isAgentParticipantForCurrentUser);
+  if (!agentParticipant) return;
+
+  const participantId = agentParticipant.id || agentParticipant.participantId;
 
   const attrs = await getConversationCustomAttributes(conversationId);
   if (!matchesForcedUnpark(attrs)) return;
 
-  await waitForACWAndWrapup(conversationId, p.id || p.participantId);
+  const state = agentParticipant.state || agentParticipant.participantState;
+  const wrapupRequired = agentParticipant.wrapupRequired;
+
+  log('Live Notification Check', 'info', {
+    conversationId,
+    state,
+    wrapupRequired
+  });
+
+  const interactionActive = state === 'wrapup' || state === 'connected';
+
+  if (!wrapupRequired || !interactionActive) {
+    return;
+  }
+
+  const key = `${conversationId}:${participantId}`;
+  if (recentlyPatched.has(key)) return;
+
+  recentlyPatched.set(key, Date.now());
+
+  try {
+    await patchAgentParticipantWrapup(conversationId, participantId);
+
+    const verification = await verifyParticipant(conversationId, participantId);
+
+    log('✅ Wrap-up applied (event-driven)', 'info', {
+      conversationId,
+      verification
+    });
+
+  } catch (err) {
+    log('❌ Wrap-up failed', 'error', err.message);
+  }
 }
 
 async function start() {
