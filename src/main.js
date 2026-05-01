@@ -5,68 +5,24 @@ import { config } from './config.js';
 const apiClient = platformClient.ApiClient.instance;
 const usersApi = new platformClient.UsersApi();
 const notificationsApi = new platformClient.NotificationsApi();
-const params = new URLSearchParams(window.location.search);
 
-const gcHostOrigin = params.get('gcHostOrigin');
+const params = new URLSearchParams(window.location.search);
 const gcTargetEnv = params.get('gcTargetEnv');
 
-// Fallback if not embedded (local dev)
+// Fallback for local dev
 const REGION = gcTargetEnv || 'euw2.pure.cloud';
-const BASE_URL = `https://api.${REGION}`;
-
-console.log('Environment:', REGION);
-console.log('Host Origin:', gcHostOrigin);
 
 let clientApp;
 let currentUser;
 let notificationChannel;
 let socket;
 let running = false;
-const recentlyPatched = new Map();
 
-const elements = {
-  env: document.getElementById('env'),
-  user: document.getElementById('user'),
-  channel: document.getElementById('channel'),
-  lastAction: document.getElementById('lastAction'),
-  log: document.getElementById('log'),
-  startBtn: document.getElementById('startBtn'),
-  stopBtn: document.getElementById('stopBtn'),
-  clearBtn: document.getElementById('clearBtn')
-};
+const recentlyPatched = new Map();
 
 function log(message, level = 'info', data) {
   const ts = new Date().toISOString();
-  const suffix = data ? ` ${JSON.stringify(data, null, 2)}` : '';
-  const line = `[${ts}] ${message}${suffix}`;
-  elements.log.textContent = `${line}\n${elements.log.textContent}`;
-  console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](message, data || '');
-}
-
-function setStatus(text) {
-  elements.lastAction.textContent = text;
-}
-
-function getInterpolatedValue(name, fallback = '') {
-  const search = new URLSearchParams(window.location.search);
-  return search.get(name) || localStorage.getItem(name) || fallback;
-}
-
-function storeInterpolatedValues() {
-  ['gcTargetEnv', 'gcHostOrigin', 'gcLangTag'].forEach((key) => {
-    const value = new URLSearchParams(window.location.search).get(key);
-    if (value) {
-      localStorage.setItem(key, value);
-    }
-  });
-}
-
-function getEnvironment() {
-  const env = getInterpolatedValue('gcTargetEnv');
-  if (!env) {
-    throw new Error('Missing gcTargetEnv.');
-  }
-  return env;
+  console[level]( `[${ts}] ${message}`, data || '' );
 }
 
 function getTopic(userId) {
@@ -74,30 +30,24 @@ function getTopic(userId) {
 }
 
 function getAccessToken() {
-  const token = apiClient.authData?.accessToken || apiClient.accessToken;
-  if (!token) {
-    throw new Error('No access token');
-  }
-  return token;
+  return apiClient.authData?.accessToken || apiClient.accessToken;
 }
 
 async function authenticatedFetch(path, options = {}) {
   const token = getAccessToken();
-  const basePath = `https://api.${getEnvironment()}`;
-  const url = `${basePath}${path}`;
+  const url = `https://api.${REGION}${path}`;
 
   const response = await fetch(url, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...(options.headers || {})
+      Authorization: `Bearer ${token}`
     }
   });
 
   if (!response.ok) {
     const err = await response.text().catch(() => '');
-    throw new Error(`${response.status} ${response.statusText} ${err}`);
+    throw new Error(`${response.status} ${err}`);
   }
 
   if (response.status === 204) return null;
@@ -105,21 +55,17 @@ async function authenticatedFetch(path, options = {}) {
 }
 
 async function authenticate() {
-  const env = getEnvironment();
-  apiClient.setPersistSettings(true, config.persistKey);
-  apiClient.setEnvironment(env);
-  storeInterpolatedValues();
-  elements.env.textContent = env;
+  apiClient.setEnvironment(REGION);
 
   await apiClient.loginImplicitGrant(config.clientId, config.redirectUri);
 
   currentUser = await usersApi.getUsersMe();
-  elements.user.textContent = `${currentUser.name}`;
+  log('Authenticated', 'info', currentUser.id);
 }
 
 async function initClientApp() {
   clientApp = new ClientApp({
-    gcTargetEnv: getEnvironment()
+    gcTargetEnv: REGION
   });
 }
 
@@ -130,21 +76,29 @@ async function createNotificationChannel() {
     notificationChannel.id,
     [{ id: getTopic(currentUser.id) }]
   );
+
+  log('Subscribed to conversationsummary', 'info', {
+    channelId: notificationChannel.id
+  });
 }
 
 function connectWebSocket() {
   socket = new WebSocket(notificationChannel.connectUri);
 
-  socket.addEventListener('message', async (event) => {
-    const payload = JSON.parse(event.data);
-    if (!payload.topicName || !payload.eventBody) return;
-
-    await handleConversationNotification(payload.topicName, payload.eventBody);
+  socket.addEventListener('open', () => {
+    log('WebSocket connected');
   });
-}
 
-function isAgentParticipantForCurrentUser(p) {
-  return p?.purpose === 'agent' && p?.userId === currentUser.id;
+  socket.addEventListener('message', async (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (!payload.topicName || !payload.eventBody) return;
+
+      await handleConversationNotification(payload.topicName, payload.eventBody);
+    } catch (err) {
+      log('WebSocket parse error', 'error', err.message);
+    }
+  });
 }
 
 async function getConversationCustomAttributes(conversationId) {
@@ -180,65 +134,43 @@ async function verifyParticipant(conversationId, participantId) {
 
   return {
     wrapupRequired: p?.wrapupRequired,
-    wrapup: p?.wrapup,
-    state: p?.state
+    state: p?.state,
+    wrapup: p?.wrapup
   };
 }
 
-async function waitForACWAndWrapup(conversationId, participantId) {
-  const key = `${conversationId}:${participantId}`;
-  if (recentlyPatched.has(key)) return;
-
-  for (let i = 0; i < 6; i++) {
-    const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
-    const p = convo.participants.find(isAgentParticipantForCurrentUser);
-
-    if (!p) return;
-
-    const state = p.state;
-    const active = state === 'wrapup' || state === 'connected';
-
-    log('ACW Check', 'info', { state, wrapupRequired: p.wrapupRequired });
-
-    if (p.wrapupRequired && active) {
-      recentlyPatched.set(key, Date.now());
-
-      await patchAgentParticipantWrapup(conversationId, participantId);
-
-      const v = await verifyParticipant(conversationId, participantId);
-
-      log('Wrap-up applied', 'info', v);
-      return;
-    }
-
-    await new Promise((r) => setTimeout(r, 400));
-  }
-}
-
+/* 🔥 FINAL FIXED HANDLER */
 async function handleConversationNotification(topicName, eventBody) {
   if (!topicName.includes('conversationsummary')) return;
 
-  const conversationId = eventBody.conversationId;
+  const conversationId =
+    eventBody.conversationId ||
+    eventBody.id;
+
   if (!conversationId) return;
 
-  const participants = eventBody.participants || [];
+  log('🔥 Event received', 'info', { conversationId });
 
-  const agentParticipant = participants.find(p =>
-    p.userId === currentUser.id && p.purpose === 'agent'
+  // 🔥 ALWAYS fetch real conversation state
+  const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
+
+  const agentParticipant = convo.participants.find(p =>
+    p.userId === currentUser.id &&
+    p.purpose === 'agent'
   );
 
   if (!agentParticipant) return;
 
-  const wrapupRequired = agentParticipant.wrapupRequired;
-  const state = agentParticipant.state;
+  const { wrapupRequired, state } = agentParticipant;
 
-  log('Summary Event Check', 'info', {
+  log('🔍 Live State', 'info', {
     conversationId,
     wrapupRequired,
     state
   });
 
-  const interactionActive = state === 'wrapup' || state === 'connected';
+  const interactionActive =
+    state === 'wrapup' || state === 'connected';
 
   if (!wrapupRequired || !interactionActive) return;
 
@@ -246,8 +178,8 @@ async function handleConversationNotification(topicName, eventBody) {
   if (!matchesForcedUnpark(attrs)) return;
 
   const participantId = agentParticipant.id;
-
   const key = `${conversationId}:${participantId}`;
+
   if (recentlyPatched.has(key)) return;
 
   recentlyPatched.set(key, Date.now());
@@ -257,7 +189,7 @@ async function handleConversationNotification(topicName, eventBody) {
 
     const verification = await verifyParticipant(conversationId, participantId);
 
-    log('✅ Wrap-up applied (summary event)', 'info', {
+    log('✅ Wrap-up applied', 'info', {
       conversationId,
       verification
     });
@@ -268,10 +200,15 @@ async function handleConversationNotification(topicName, eventBody) {
 }
 
 async function start() {
+  if (running) return;
+  running = true;
+
   await initClientApp();
   await authenticate();
   await createNotificationChannel();
   connectWebSocket();
+
+  log('Auto-wrap helper started');
 }
 
-elements.startBtn.onclick = start;
+document.getElementById('startBtn').onclick = start;
