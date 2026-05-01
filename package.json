@@ -1,0 +1,18 @@
+{
+  "name": "genesys-auto-wrapup-helper",
+  "version": "3.5.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "purecloud-client-app-sdk": "^2.6.7",
+    "purecloud-platform-client-v2": "^251.1.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.14"
+  }
+}

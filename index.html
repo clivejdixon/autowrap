@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Genesys Auto Wrap-up Helper</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #0b1020;
+        color: #e5e7eb;
+      }
+      .card {
+        max-width: 1100px;
+        margin: 0 auto;
+        background: #111827;
+        border: 1px solid #374151;
+        border-radius: 12px;
+        padding: 20px;
+      }
+      h1 { margin-top: 0; font-size: 1.3rem; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+        margin: 16px 0;
+      }
+      .stat {
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 12px;
+      }
+      .label { font-size: 0.8rem; color: #93c5fd; }
+      .value { font-weight: 700; margin-top: 4px; word-break: break-all; }
+      .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+      button {
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-weight: 600;
+        cursor: pointer;
+        background: #2563eb;
+        color: white;
+      }
+      button.secondary { background: #374151; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      pre {
+        background: #020617;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        padding: 12px;
+        overflow: auto;
+        max-height: 420px;
+        white-space: pre-wrap;
+      }
+      .hint { color: #cbd5e1; font-size: 0.95rem; }
+      .ok { color: #86efac; }
+      .warn { color: #fcd34d; }
+      .err { color: #fca5a5; }
+      code { background: #1f2937; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Genesys Auto Wrap-up Helper</h1>
+      <div class="hint">
+        Watches <code>v2.users.{userId}.conversations</code> and, when the current user is put into wrap-up for an email whose
+        conversation custom attributes include <code>ForcedUnpark=true</code>, patches the participant wrap-up to
+        <code>CD_AutoUnparked</code>.
+      </div>
+      <div class="grid">
+        <div class="stat"><div class="label">Environment</div><div class="value" id="env">-</div></div>
+        <div class="stat"><div class="label">Current User</div><div class="value" id="user">-</div></div>
+        <div class="stat"><div class="label">Channel</div><div class="value" id="channel">-</div></div>
+        <div class="stat"><div class="label">Last Action</div><div class="value" id="lastAction">Waiting</div></div>
+      </div>
+      <div class="controls">
+        <button id="startBtn">Start helper</button>
+        <button id="stopBtn" class="secondary" disabled>Stop helper</button>
+        <button id="clearBtn" class="secondary">Clear log</button>
+      </div>
+      <pre id="log"></pre>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
