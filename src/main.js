@@ -5,6 +5,17 @@ import { config } from './config.js';
 const apiClient = platformClient.ApiClient.instance;
 const usersApi = new platformClient.UsersApi();
 const notificationsApi = new platformClient.NotificationsApi();
+const params = new URLSearchParams(window.location.search);
+
+const gcHostOrigin = params.get('gcHostOrigin');
+const gcTargetEnv = params.get('gcTargetEnv');
+
+// Fallback if not embedded (local dev)
+const REGION = gcTargetEnv || 'euw2.pure.cloud';
+const BASE_URL = `https://api.${REGION}`;
+
+console.log('Environment:', REGION);
+console.log('Host Origin:', gcHostOrigin);
 
 let clientApp;
 let currentUser;
