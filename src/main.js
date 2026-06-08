@@ -10,19 +10,30 @@ const params = new URLSearchParams(window.location.search);
 const gcHostOrigin = params.get('gcHostOrigin');
 const gcTargetEnv = params.get('gcTargetEnv');
 
+const ENVIRONMENT_MAP = {
+  'prod-euw2': 'euw2.pure.cloud',
+  'euw2': 'euw2.pure.cloud'
+};
+
+function normalizeEnvironment(env) {
+  if (!env) return '';
+  return ENVIRONMENT_MAP[env] || env;
+}
+
 // Fallback if not embedded (local dev)
-const REGION = gcTargetEnv || 'euw2.pure.cloud';
+const RAW_REGION = gcTargetEnv || 'euw2.pure.cloud';
+const REGION = normalizeEnvironment(RAW_REGION);
 const BASE_URL = `https://api.${REGION}`;
 
-console.log('Environment:', REGION);
-console.log('Host Origin:', gcHostOrigin);
-console.log('Base URL:', BASE_URL);
-console.log('AUTO-WRAP main.js loaded', {
+console.log('🚀 AUTO-WRAP main.js loaded', {
   href: window.location.href,
   pathname: window.location.pathname,
   search: window.location.search,
   time: new Date().toISOString()
 });
+console.log('Environment:', REGION);
+console.log('Host Origin:', gcHostOrigin);
+console.log('Base URL:', BASE_URL);
 
 let clientApp;
 let currentUser;
@@ -43,32 +54,26 @@ const elements = {
   clearBtn: document.getElementById('clearBtn')
 };
 
-function serializeError(err) {
-  if (!err) return {};
-  return {
-    message: err.message || String(err),
-    stack: err.stack || '',
-    name: err.name || 'Error'
-  };
-}
-
 function log(message, level = 'info', data) {
   const ts = new Date().toISOString();
-  const suffix = data !== undefined ? ` ${JSON.stringify(data, null, 2)}` : '';
+  const suffix = data ? ` ${JSON.stringify(data, null, 2)}` : '';
   const line = `[${ts}] ${message}${suffix}`;
   if (elements.log) {
     elements.log.textContent = `${line}\n${elements.log.textContent}`;
   }
-  const fn =
-    level === 'error' ? console.error :
-    level === 'warn' ? console.warn :
-    console.log;
-  fn(message, data ?? '');
+  const fn = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log';
+  console[fn](message, data || '');
 }
 
 function setStatus(text) {
   if (elements.lastAction) {
     elements.lastAction.textContent = text;
+  }
+}
+
+function clearLog() {
+  if (elements.log) {
+    elements.log.textContent = '';
   }
 }
 
@@ -87,33 +92,23 @@ function storeInterpolatedValues() {
 }
 
 function getEnvironment() {
-  const env = getInterpolatedValue('gcTargetEnv').trim();
+  const env = normalizeEnvironment(getInterpolatedValue('gcTargetEnv'));
   if (!env) {
     throw new Error('Missing gcTargetEnv.');
   }
   return env;
 }
 
-function getGcHostOrigin() {
-  const raw = getInterpolatedValue('gcHostOrigin').trim();
-
-  if (!raw) {
+function getHostOrigin() {
+  const origin = getInterpolatedValue('gcHostOrigin');
+  if (!origin) {
     throw new Error('Missing gcHostOrigin.');
   }
-
-  try {
-    const url = new URL(raw);
-    return url.origin;
-  } catch {
-    throw new Error(`Invalid gcHostOrigin provided: ${raw}`);
-  }
+  return origin;
 }
 
-function getTopics(userId) {
-  return [
-    `v2.users.${userId}.conversations`,
-    `v2.users.${userId}.conversationsummary`
-  ];
+function getTopic(userId) {
+  return `v2.users.${userId}.conversationsummary`;
 }
 
 function getAccessToken() {
@@ -157,91 +152,93 @@ async function authenticate() {
     elements.env.textContent = env;
   }
 
+  log('authenticate() starting', 'info', { env });
+
   await apiClient.loginImplicitGrant(config.clientId, config.redirectUri);
 
   currentUser = await usersApi.getUsersMe();
-
   if (elements.user) {
     elements.user.textContent = `${currentUser.name}`;
   }
 
-  log('Authenticated', 'info', {
+  log('Authenticated user loaded', 'info', {
     userId: currentUser.id,
-    userName: currentUser.name,
-    env
+    name: currentUser.name
   });
 }
 
 async function initClientApp() {
   const env = getEnvironment();
-  const hostOrigin = getGcHostOrigin();
+  const hostOrigin = getHostOrigin();
 
-  log('initClientApp() starting', 'info', { env, hostOrigin });
+  log('initClientApp() starting', 'info', {
+    env,
+    hostOrigin
+  });
 
   clientApp = new ClientApp({
     gcTargetEnv: env,
     gcHostOrigin: hostOrigin
   });
-
-  setStatus('Client app initialized');
 }
 
 async function createNotificationChannel() {
   notificationChannel = await notificationsApi.postNotificationsChannels();
 
-  const topics = getTopics(currentUser.id);
-
   await notificationsApi.postNotificationsChannelSubscriptions(
     notificationChannel.id,
-    topics.map((id) => ({ id }))
+    [{ id: getTopic(currentUser.id) }]
   );
 
   if (elements.channel) {
-    elements.channel.textContent = notificationChannel.id;
+    elements.channel.textContent = notificationChannel.id || '';
   }
 
   log('Notification channel created', 'info', {
     channelId: notificationChannel.id,
-    topics
+    connectUri: notificationChannel.connectUri
   });
 }
 
 function connectWebSocket() {
   if (!notificationChannel?.connectUri) {
-    throw new Error('Missing notification channel connectUri');
+    throw new Error('Notification channel connectUri is missing');
   }
 
   socket = new WebSocket(notificationChannel.connectUri);
 
   socket.addEventListener('open', () => {
-    log('WebSocket connected', 'info', { connectUri: notificationChannel.connectUri });
-    setStatus('WebSocket connected');
+    log('WebSocket connected', 'info');
+    setStatus('Connected');
   });
 
   socket.addEventListener('close', () => {
     log('WebSocket closed', 'warn');
-    setStatus('WebSocket closed');
+    setStatus('Disconnected');
   });
 
   socket.addEventListener('error', (event) => {
-    log('WebSocket error', 'error', serializeError(event?.error || event));
+    log('WebSocket error', 'error', event);
   });
 
   socket.addEventListener('message', async (event) => {
-    let payload;
-
     try {
-      payload = JSON.parse(event.data);
-    } catch (err) {
-      log('Ignoring non-JSON websocket message', 'warn', {
-        raw: String(event.data).slice(0, 500)
+      const payload = JSON.parse(event.data);
+
+      if (!payload.topicName || !payload.eventBody) return;
+
+      log('Notification received', 'info', {
+        topicName: payload.topicName,
+        raw: payload.eventBody
       });
-      return;
+
+      await handleConversationNotification(payload.topicName, payload.eventBody);
+    } catch (err) {
+      log('Failed to process socket message', 'error', {
+        message: err?.message || String(err),
+        raw: event.data
+      });
     }
-
-    if (!payload.topicName || !payload.eventBody) return;
-
-    await handleConversationNotification(payload.topicName, payload.eventBody);
   });
 }
 
@@ -251,15 +248,9 @@ function isAgentParticipantForCurrentUser(p) {
 
 async function getConversationCustomAttributes(conversationId) {
   try {
-    const attrs = await authenticatedFetch(
-      `/api/v2/conversations/${conversationId}/customattributes`
-    );
+    const attrs = await authenticatedFetch(`/api/v2/conversations/${conversationId}/customattributes`);
     return attrs?.customAttributes || attrs || {};
-  } catch (err) {
-    log('Failed to load custom attributes', 'warn', {
-      conversationId,
-      error: serializeError(err)
-    });
+  } catch {
     return {};
   }
 }
@@ -284,7 +275,7 @@ async function verifyParticipant(conversationId, participantId) {
   await new Promise((r) => setTimeout(r, 300));
 
   const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
-  const p = convo?.participants?.find((x) => (x.id || x.participantId) === participantId);
+  const p = convo.participants.find((x) => (x.id || x.participantId) === participantId);
 
   return {
     wrapupRequired: p?.wrapupRequired,
@@ -299,14 +290,14 @@ async function waitForACWAndWrapup(conversationId, participantId) {
 
   for (let i = 0; i < 6; i++) {
     const convo = await authenticatedFetch(`/api/v2/conversations/emails/${conversationId}`);
-    const p = convo?.participants?.find(isAgentParticipantForCurrentUser);
+    const p = convo.participants.find(isAgentParticipantForCurrentUser);
 
     if (!p) return;
 
     const state = p.state;
     const active = state === 'wrapup' || state === 'connected';
 
-    log('ACW Check', 'info', { conversationId, participantId, state, wrapupRequired: p.wrapupRequired });
+    log('ACW Check', 'info', { state, wrapupRequired: p.wrapupRequired });
 
     if (p.wrapupRequired && active) {
       recentlyPatched.set(key, Date.now());
@@ -324,21 +315,10 @@ async function waitForACWAndWrapup(conversationId, participantId) {
 }
 
 async function handleConversationNotification(topicName, eventBody) {
-  if (
-    !topicName.includes('conversations') &&
-    !topicName.includes('conversationsummary')
-  ) {
-    return;
-  }
+  if (!topicName.includes('conversations') && !topicName.includes('conversationsummary')) return;
 
   const conversationId = eventBody.conversationId;
   if (!conversationId) return;
-
-  log('🔥 Notification received', 'info', {
-    topicName,
-    conversationId,
-    raw: eventBody
-  });
 
   const participants = eventBody.participants || [];
 
@@ -346,23 +326,15 @@ async function handleConversationNotification(topicName, eventBody) {
     p.userId === currentUser.id && p.purpose === 'agent'
   );
 
-  if (!agentParticipant) {
-    log('No agent participant found in event body', 'warn', {
-      conversationId,
-      currentUserId: currentUser?.id
-    });
-    return;
-  }
+  if (!agentParticipant) return;
 
   const wrapupRequired = agentParticipant.wrapupRequired;
   const state = agentParticipant.state;
 
-  log('Summary/Event Check', 'info', {
+  log('Summary Event Check', 'info', {
     conversationId,
-    participantId: agentParticipant.id,
     wrapupRequired,
-    state,
-    topicName
+    state
   });
 
   const interactionActive = state === 'wrapup' || state === 'connected';
@@ -370,10 +342,7 @@ async function handleConversationNotification(topicName, eventBody) {
   if (!wrapupRequired || !interactionActive) return;
 
   const attrs = await getConversationCustomAttributes(conversationId);
-  if (!matchesForcedUnpark(attrs)) {
-    log('ForcedUnpark not set, skipping', 'info', { conversationId, attrs });
-    return;
-  }
+  if (!matchesForcedUnpark(attrs)) return;
 
   const participantId = agentParticipant.id;
   const key = `${conversationId}:${participantId}`;
@@ -386,38 +355,18 @@ async function handleConversationNotification(topicName, eventBody) {
 
     const verification = await verifyParticipant(conversationId, participantId);
 
-    log('✅ Wrap-up applied (auto)', 'info', {
+    log('✅ Wrap-up applied (summary event)', 'info', {
       conversationId,
-      participantId,
       verification
     });
-
   } catch (err) {
-    log('❌ Wrap-up failed', 'error', serializeError(err));
+    log('❌ Wrap-up failed', 'error', err.message);
   }
-}
-
-async function stop() {
-  running = false;
-
-  try {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close();
-    }
-  } catch {
-    // ignore
-  }
-
-  socket = undefined;
-  notificationChannel = undefined;
-
-  setStatus('Stopped');
-  log('Helper stopped', 'info');
 }
 
 async function start() {
   if (running) {
-    log('Start ignored; helper already running', 'warn');
+    log('start() ignored because helper is already running', 'warn');
     return;
   }
 
@@ -430,49 +379,66 @@ async function start() {
     await authenticate();
     await createNotificationChannel();
     connectWebSocket();
+
     setStatus('Running');
     log('Helper started successfully', 'info', {
       userId: currentUser?.id,
-      env: getEnvironment()
+      channelId: notificationChannel?.id
     });
   } catch (err) {
     running = false;
-    setStatus('Start failed');
-    log('Failed to start helper', 'error', serializeError(err));
-    throw err;
+    setStatus('Waiting');
+    log('Failed to start helper', 'error', {
+      message: err?.message || String(err),
+      stack: err?.stack
+    });
   }
 }
 
-async function autoStart() {
+function stop() {
+  log('stop() clicked', 'info');
+  try {
+    if (socket) {
+      socket.close();
+      socket = null;
+    }
+  } catch (err) {
+    log('Error while closing socket', 'warn', {
+      message: err?.message || String(err)
+    });
+  }
+
+  running = false;
+  setStatus('Stopped');
+}
+
+function bindUI() {
+  if (elements.startBtn) {
+    elements.startBtn.onclick = start;
+  }
+
+  if (elements.stopBtn) {
+    elements.stopBtn.onclick = stop;
+  }
+
+  if (elements.clearBtn) {
+    elements.clearBtn.onclick = clearLog;
+  }
+}
+
+function autoStart() {
   if (autoStartAttempted) return;
   autoStartAttempted = true;
 
-  try {
-    await start();
-  } catch (err) {
-    log('Auto-start failed', 'error', serializeError(err));
-  }
+  // Auto-start when embedded or when opened directly.
+  // The running flag prevents duplicate startup if the button is also clicked.
+  start();
 }
 
-function wireUi() {
-  if (elements.startBtn) {
-    elements.startBtn.onclick = () => start().catch(() => {});
-  }
-  if (elements.stopBtn) {
-    elements.stopBtn.onclick = () => stop().catch(() => {});
-  }
-  if (elements.clearBtn) {
-    elements.clearBtn.onclick = () => {
-      if (elements.log) elements.log.textContent = '';
-      setStatus('Waiting');
-    };
-  }
-}
-
-wireUi();
+bindUI();
 
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', autoStart, { once: true });
+  document.addEventListener('DOMContentLoaded', autoStart);
 } else {
   autoStart();
 }
