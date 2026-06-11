@@ -9,8 +9,8 @@ const usersApi = new platformClient.UsersApi();
 const notificationsApi = new platformClient.NotificationsApi();
 const params = new URLSearchParams(window.location.search);
 
-const gcHostOriginRaw = params.get('gcHostOrigin');
-const gcTargetEnvRaw = params.get('gcTargetEnv');
+const gcHostOriginRaw = (params.get('gcHostOrigin') || localStorage.getItem('gcHostOrigin') || '').trim();
+const gcTargetEnvRaw = (params.get('gcTargetEnv') || localStorage.getItem('gcTargetEnv') || 'euw2.pure.cloud').trim();
 
 const ENVIRONMENT_MAP = {
   'prod-euw2': 'euw2.pure.cloud',
@@ -24,14 +24,7 @@ const ENVIRONMENT_MAP = {
   'mypurecloud.com': 'mypurecloud.com',
   'euw2.pure.cloud': 'euw2.pure.cloud',
   'use1.pure.cloud': 'use1.pure.cloud',
-  'usw2.pure.cloud': 'usw2.pure.cloud'
-};
-
-const CLIENT_TARGET_ENV_MAP = {
-  'euw2.pure.cloud': 'prod-euw2',
-  'use1.pure.cloud': 'prod-use1',
-  'usw2.pure.cloud': 'prod-usw2',
-  'mypurecloud.com': 'mypurecloud',
+  'usw2.pure.cloud': 'usw2.pure.cloud',
   'mypurecloud.ie': 'mypurecloud.ie',
   'mypurecloud.de': 'mypurecloud.de',
   'mypurecloud.jp': 'mypurecloud.jp'
@@ -42,25 +35,32 @@ function normalizeEnvironment(env) {
   return ENVIRONMENT_MAP[env] || env;
 }
 
-function resolveClientTargetEnv(rawTargetEnv, apiEnv) {
-  const trimmed = (rawTargetEnv || '').trim();
-  if (trimmed && !trimmed.includes('.pure.cloud')) {
-    return trimmed;
+function getEnvironment() {
+  const env = normalizeEnvironment(gcTargetEnvRaw);
+  if (!env) {
+    throw new Error('Missing gcTargetEnv.');
   }
-
-  if (trimmed && CLIENT_TARGET_ENV_MAP[trimmed]) {
-    return CLIENT_TARGET_ENV_MAP[trimmed];
-  }
-
-  return CLIENT_TARGET_ENV_MAP[apiEnv] || trimmed || apiEnv || 'prod-euw2';
+  return env;
 }
 
-// Fallback if not embedded (local dev)
-const RAW_REGION = gcTargetEnvRaw || 'prod-euw2';
-const API_REGION = normalizeEnvironment(RAW_REGION);
-const CLIENT_TARGET_ENV = resolveClientTargetEnv(gcTargetEnvRaw, API_REGION);
-const HOST_ORIGIN = (gcHostOriginRaw || '').trim();
-const BASE_URL = `https://api.${API_REGION}`;
+function getSdkTargetEnv() {
+  // For the Genesys client-app SDK, use the actual cloud environment label.
+  // This avoids turning euw2 into a login.prod-euw2 style hostname.
+  return getEnvironment();
+}
+
+function getHostOrigin() {
+  if (gcHostOriginRaw) return gcHostOriginRaw;
+
+  const env = getEnvironment();
+  if (env === 'mypurecloud.com') return 'https://apps.mypurecloud.com';
+  if (env.endsWith('.pure.cloud')) return `https://apps.${env}`;
+  return `https://apps.${env}`;
+}
+
+function getBaseUrl() {
+  return `https://api.${getEnvironment()}`;
+}
 
 console.log('🚀 AUTO-WRAP main.js loaded', {
   href: window.location.href,
@@ -68,10 +68,9 @@ console.log('🚀 AUTO-WRAP main.js loaded', {
   search: window.location.search,
   time: new Date().toISOString()
 });
-console.log('Environment:', API_REGION);
-console.log('Client Target Env:', CLIENT_TARGET_ENV);
-console.log('Host Origin:', HOST_ORIGIN);
-console.log('Base URL:', BASE_URL);
+console.log('Environment:', getEnvironment());
+console.log('Host Origin:', getHostOrigin());
+console.log('Base URL:', getBaseUrl());
 
 let clientApp;
 let currentUser;
@@ -131,31 +130,6 @@ function storeInterpolatedValues() {
   });
 }
 
-function getEnvironment() {
-  const env = normalizeEnvironment(getInterpolatedValue('gcTargetEnv', RAW_REGION));
-  if (!env) {
-    throw new Error('Missing gcTargetEnv.');
-  }
-  return env;
-}
-
-function getClientTargetEnv() {
-  const raw = getInterpolatedValue('gcTargetEnv', CLIENT_TARGET_ENV);
-  return resolveClientTargetEnv(raw, getEnvironment());
-}
-
-function getHostOrigin() {
-  const origin = getInterpolatedValue('gcHostOrigin', HOST_ORIGIN);
-  if (!origin) {
-    throw new Error('Missing gcHostOrigin.');
-  }
-  return origin;
-}
-
-function getTopic(userId) {
-  return `v2.users.${userId}.conversationsummary`;
-}
-
 function getAccessToken() {
   const token = apiClient.authData?.accessToken || apiClient.accessToken;
   if (!token) {
@@ -166,8 +140,7 @@ function getAccessToken() {
 
 async function authenticatedFetch(path, options = {}) {
   const token = getAccessToken();
-  const basePath = `https://api.${getEnvironment()}`;
-  const url = `${basePath}${path}`;
+  const url = `${getBaseUrl()}${path}`;
 
   const response = await fetch(url, {
     ...options,
@@ -189,6 +162,7 @@ async function authenticatedFetch(path, options = {}) {
 
 async function authenticate() {
   const env = getEnvironment();
+
   apiClient.setPersistSettings(true, config.persistKey);
   apiClient.setEnvironment(env);
   storeInterpolatedValues();
@@ -215,20 +189,16 @@ async function authenticate() {
 async function initClientApp() {
   const env = getEnvironment();
   const hostOrigin = getHostOrigin();
-  const targetEnv = getClientTargetEnv();
+  const sdkTargetEnv = getSdkTargetEnv();
 
   log('initClientApp() starting', 'info', {
     env,
-    targetEnv,
+    sdkTargetEnv,
     hostOrigin
   });
 
-  // Keep platform client on the API environment.
-  apiClient.setEnvironment(env);
-
-  // ClientApp needs the Genesys target env form, not the API host name form.
   clientApp = new ClientApp({
-    gcTargetEnv: targetEnv,
+    gcTargetEnv: sdkTargetEnv,
     gcHostOrigin: hostOrigin
   });
 }
@@ -238,7 +208,7 @@ async function createNotificationChannel() {
 
   await notificationsApi.postNotificationsChannelSubscriptions(
     notificationChannel.id,
-    [{ id: getTopic(currentUser.id) }]
+    [{ id: `v2.users.${currentUser.id}.conversationsummary` }]
   );
 
   if (elements.channel) {
@@ -294,7 +264,7 @@ function connectWebSocket() {
 }
 
 function isAgentParticipantForCurrentUser(p) {
-  return p?.purpose === 'agent' && p?.userId === currentUser.id;
+  return p?.purpose === 'agent' && p?.userId === currentUser?.id;
 }
 
 async function getConversationCustomAttributes(conversationId) {
@@ -365,16 +335,26 @@ async function waitForACWAndWrapup(conversationId, participantId) {
   }
 }
 
+function getConversationIdFromEventBody(eventBody) {
+  return (
+    eventBody?.conversationId ||
+    eventBody?.conversation?.id ||
+    eventBody?.conversation?.conversationId ||
+    eventBody?.id ||
+    ''
+  );
+}
+
 async function handleConversationNotification(topicName, eventBody) {
   if (!topicName.includes('conversations') && !topicName.includes('conversationsummary')) return;
 
-  const conversationId = eventBody.conversationId;
+  const conversationId = getConversationIdFromEventBody(eventBody);
   if (!conversationId) return;
 
   const participants = eventBody.participants || [];
 
-  const agentParticipant = participants.find((p) =>
-    p.userId === currentUser.id && p.purpose === 'agent'
+  const agentParticipant = participants.find(
+    (p) => p.userId === currentUser.id && p.purpose === 'agent'
   );
 
   if (!agentParticipant) return;
@@ -389,13 +369,12 @@ async function handleConversationNotification(topicName, eventBody) {
   });
 
   const interactionActive = state === 'wrapup' || state === 'connected';
-
   if (!wrapupRequired || !interactionActive) return;
 
   const attrs = await getConversationCustomAttributes(conversationId);
   if (!matchesForcedUnpark(attrs)) return;
 
-  const participantId = agentParticipant.id;
+  const participantId = agentParticipant.id || agentParticipant.participantId;
   const key = `${conversationId}:${participantId}`;
   if (recentlyPatched.has(key)) return;
 
@@ -411,7 +390,9 @@ async function handleConversationNotification(topicName, eventBody) {
       verification
     });
   } catch (err) {
-    log('❌ Wrap-up failed', 'error', err.message);
+    log('❌ Wrap-up failed', 'error', {
+      message: err?.message || String(err)
+    });
   }
 }
 
@@ -444,7 +425,6 @@ async function start() {
           userId: currentUser?.id,
           channelId: notificationChannel?.id,
           env: getEnvironment(),
-          clientTargetEnv: getClientTargetEnv(),
           hostOrigin: getHostOrigin()
         });
       }, 60000);
@@ -461,6 +441,7 @@ async function start() {
 
 function stop() {
   log('stop() clicked', 'info');
+
   try {
     if (socket) {
       socket.close();
@@ -475,6 +456,11 @@ function stop() {
   if (autoStartRetryTimer) {
     clearInterval(autoStartRetryTimer);
     autoStartRetryTimer = null;
+  }
+
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 
   running = false;
@@ -499,10 +485,8 @@ function autoStart() {
   if (autoStartAttempted) return;
   autoStartAttempted = true;
 
-  // Auto-start immediately.
   start();
 
-  // Retry a few times in case the host runtime or auth is still warming up.
   let attempts = 0;
   const maxAttempts = 20;
   const retryDelayMs = 1000;
