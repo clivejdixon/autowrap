@@ -2,17 +2,39 @@ import platformClient from 'purecloud-platform-client-v2';
 import ClientApp from 'purecloud-client-app-sdk';
 import { config } from './config.js';
 
+const APP_NAME = 'AUTO-WRAP';
+
 const apiClient = platformClient.ApiClient.instance;
 const usersApi = new platformClient.UsersApi();
 const notificationsApi = new platformClient.NotificationsApi();
 const params = new URLSearchParams(window.location.search);
 
-const gcHostOrigin = params.get('gcHostOrigin');
-const gcTargetEnv = params.get('gcTargetEnv');
+const gcHostOriginRaw = params.get('gcHostOrigin');
+const gcTargetEnvRaw = params.get('gcTargetEnv');
 
 const ENVIRONMENT_MAP = {
   'prod-euw2': 'euw2.pure.cloud',
-  'euw2': 'euw2.pure.cloud'
+  'euw2': 'euw2.pure.cloud',
+  'prod-use1': 'use1.pure.cloud',
+  'use1': 'use1.pure.cloud',
+  'prod-usw2': 'usw2.pure.cloud',
+  'usw2': 'usw2.pure.cloud',
+  'prod-mypurecloud': 'mypurecloud.com',
+  'mypurecloud': 'mypurecloud.com',
+  'mypurecloud.com': 'mypurecloud.com',
+  'euw2.pure.cloud': 'euw2.pure.cloud',
+  'use1.pure.cloud': 'use1.pure.cloud',
+  'usw2.pure.cloud': 'usw2.pure.cloud'
+};
+
+const CLIENT_TARGET_ENV_MAP = {
+  'euw2.pure.cloud': 'prod-euw2',
+  'use1.pure.cloud': 'prod-use1',
+  'usw2.pure.cloud': 'prod-usw2',
+  'mypurecloud.com': 'mypurecloud',
+  'mypurecloud.ie': 'mypurecloud.ie',
+  'mypurecloud.de': 'mypurecloud.de',
+  'mypurecloud.jp': 'mypurecloud.jp'
 };
 
 function normalizeEnvironment(env) {
@@ -20,10 +42,25 @@ function normalizeEnvironment(env) {
   return ENVIRONMENT_MAP[env] || env;
 }
 
+function resolveClientTargetEnv(rawTargetEnv, apiEnv) {
+  const trimmed = (rawTargetEnv || '').trim();
+  if (trimmed && !trimmed.includes('.pure.cloud')) {
+    return trimmed;
+  }
+
+  if (trimmed && CLIENT_TARGET_ENV_MAP[trimmed]) {
+    return CLIENT_TARGET_ENV_MAP[trimmed];
+  }
+
+  return CLIENT_TARGET_ENV_MAP[apiEnv] || trimmed || apiEnv || 'prod-euw2';
+}
+
 // Fallback if not embedded (local dev)
-const RAW_REGION = gcTargetEnv || 'euw2.pure.cloud';
-const REGION = normalizeEnvironment(RAW_REGION);
-const BASE_URL = `https://api.${REGION}`;
+const RAW_REGION = gcTargetEnvRaw || 'prod-euw2';
+const API_REGION = normalizeEnvironment(RAW_REGION);
+const CLIENT_TARGET_ENV = resolveClientTargetEnv(gcTargetEnvRaw, API_REGION);
+const HOST_ORIGIN = (gcHostOriginRaw || '').trim();
+const BASE_URL = `https://api.${API_REGION}`;
 
 console.log('🚀 AUTO-WRAP main.js loaded', {
   href: window.location.href,
@@ -31,8 +68,9 @@ console.log('🚀 AUTO-WRAP main.js loaded', {
   search: window.location.search,
   time: new Date().toISOString()
 });
-console.log('Environment:', REGION);
-console.log('Host Origin:', gcHostOrigin);
+console.log('Environment:', API_REGION);
+console.log('Client Target Env:', CLIENT_TARGET_ENV);
+console.log('Host Origin:', HOST_ORIGIN);
 console.log('Base URL:', BASE_URL);
 
 let clientApp;
@@ -41,6 +79,8 @@ let notificationChannel;
 let socket;
 let running = false;
 let autoStartAttempted = false;
+let autoStartRetryTimer = null;
+let heartbeatTimer = null;
 const recentlyPatched = new Map();
 
 const elements = {
@@ -92,15 +132,20 @@ function storeInterpolatedValues() {
 }
 
 function getEnvironment() {
-  const env = normalizeEnvironment(getInterpolatedValue('gcTargetEnv'));
+  const env = normalizeEnvironment(getInterpolatedValue('gcTargetEnv', RAW_REGION));
   if (!env) {
     throw new Error('Missing gcTargetEnv.');
   }
   return env;
 }
 
+function getClientTargetEnv() {
+  const raw = getInterpolatedValue('gcTargetEnv', CLIENT_TARGET_ENV);
+  return resolveClientTargetEnv(raw, getEnvironment());
+}
+
 function getHostOrigin() {
-  const origin = getInterpolatedValue('gcHostOrigin');
+  const origin = getInterpolatedValue('gcHostOrigin', HOST_ORIGIN);
   if (!origin) {
     throw new Error('Missing gcHostOrigin.');
   }
@@ -170,14 +215,20 @@ async function authenticate() {
 async function initClientApp() {
   const env = getEnvironment();
   const hostOrigin = getHostOrigin();
+  const targetEnv = getClientTargetEnv();
 
   log('initClientApp() starting', 'info', {
     env,
+    targetEnv,
     hostOrigin
   });
 
+  // Keep platform client on the API environment.
+  apiClient.setEnvironment(env);
+
+  // ClientApp needs the Genesys target env form, not the API host name form.
   clientApp = new ClientApp({
-    gcTargetEnv: env,
+    gcTargetEnv: targetEnv,
     gcHostOrigin: hostOrigin
   });
 }
@@ -385,6 +436,19 @@ async function start() {
       userId: currentUser?.id,
       channelId: notificationChannel?.id
     });
+
+    if (!heartbeatTimer) {
+      heartbeatTimer = setInterval(() => {
+        log('Heartbeat', 'info', {
+          running,
+          userId: currentUser?.id,
+          channelId: notificationChannel?.id,
+          env: getEnvironment(),
+          clientTargetEnv: getClientTargetEnv(),
+          hostOrigin: getHostOrigin()
+        });
+      }, 60000);
+    }
   } catch (err) {
     running = false;
     setStatus('Waiting');
@@ -406,6 +470,11 @@ function stop() {
     log('Error while closing socket', 'warn', {
       message: err?.message || String(err)
     });
+  }
+
+  if (autoStartRetryTimer) {
+    clearInterval(autoStartRetryTimer);
+    autoStartRetryTimer = null;
   }
 
   running = false;
@@ -430,9 +499,33 @@ function autoStart() {
   if (autoStartAttempted) return;
   autoStartAttempted = true;
 
-  // Auto-start when embedded or when opened directly.
-  // The running flag prevents duplicate startup if the button is also clicked.
+  // Auto-start immediately.
   start();
+
+  // Retry a few times in case the host runtime or auth is still warming up.
+  let attempts = 0;
+  const maxAttempts = 20;
+  const retryDelayMs = 1000;
+
+  if (autoStartRetryTimer) clearInterval(autoStartRetryTimer);
+  autoStartRetryTimer = setInterval(() => {
+    attempts += 1;
+
+    if (running) {
+      clearInterval(autoStartRetryTimer);
+      autoStartRetryTimer = null;
+      return;
+    }
+
+    log(`Auto-start retry ${attempts}/${maxAttempts}`, 'warn');
+    start();
+
+    if (attempts >= maxAttempts) {
+      clearInterval(autoStartRetryTimer);
+      autoStartRetryTimer = null;
+      log('Auto-start retry loop stopped after max attempts', 'warn');
+    }
+  }, retryDelayMs);
 }
 
 bindUI();
